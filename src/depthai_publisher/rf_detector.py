@@ -7,12 +7,15 @@ from sensor_msgs.msg import Image, CompressedImage
 from cv_bridge import CvBridge
 from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
 from inference import get_model
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class RFDetectorNode:
     def __init__(self):
         # Params (can be overridden with ROS params)
         self.model_id = rospy.get_param("~model_id", "sam-tixx2/image-detector-wuwng-instant/3")
-        self.api_key  = rospy.get_param("~api_key", "2ypgrFnH0imAupDBxz5e")
+        self.api_key  = rospy.get_param("~api_key", os.getenv('ROBOFLOW_API_KEY'))
         self.image_topic = rospy.get_param("~image_topic", "/camera/color/image/compressed")
         self.score_thresh = float(rospy.get_param("~score_thresh", 0.35))
         self.classes = rospy.get_param("~classes", ["bag", "person"])  # used to map names -> IDs
