@@ -1,39 +1,89 @@
 #!/usr/bin/env python3
+
+
+##Intended usage: 
+#Python+++++++++++++++++++++++++++++++++++++++
+# import rospy
+# from geometry_msgs.msg import PointStamped
+
+# def cb(msg):
+#     print("x:", msg.point.x, "y:", msg.point.y)
+
+# rospy.init_node("listen_marker_23")
+# rospy.Subscriber("/marker_locations/id/23", PointStamped, cb)
+# rospy.spin()
+#Bash++++++++++++++++++++++++++++++
+#rostopic echo /marker_locations/id/23
 import cv2
 import rospy
-from sensor_msgs.msg import CompressedImage
-from cv_bridge import CvBridge, CvBridgeError
 import numpy as np
+from sensor_msgs.msg import CompressedImage
+from geometry_msgs.msg import PoseStamped, PointStamped
+from std_msgs.msg import Float32MultiArray
+from cv_bridge import CvBridge, CvBridgeError
+from collections import defaultdict, deque
+
+
 
 class ArucoDetector():
     frame_sub_topic = '/depthai_node/image/compressed'
+    pose_sub_topic  = '/mavros/vision_pose/pose'
 
     def __init__(self):
-        # --- Choose your dictionary here ---
-        dict_id = cv2.aruco.DICT_5X5_100   # change to DICT_5X5_250 if you use 5x5 markers
+        # ---- Params ----
+        self.hfov_deg = rospy.get_param('~hfov_deg', 54.0)
+        self.vfov_deg = rospy.get_param('~vfov_deg', 54.0)
+        self.fixed_alt_m = rospy.get_param('~fixed_altitude_m', 2.5)
+        self.use_live_alt = rospy.get_param('~use_live_altitude', True)
+        self.avg_window = int(rospy.get_param('~avg_window', 10))
 
-        # --- Handle both new and old OpenCV ArUco APIs ---
+        # Image intrinsics
+        self.W = None
+        self.H = None
+        self.fpx_h = None
+        self.fpx_v = None
+
+        # Pose/altitude
+        self.altitude_m = None
+
+        # Sliding buffers: id -> deque of (x, y)
+        self.hist = defaultdict(lambda: deque(maxlen=self.avg_window))
+
+        # Per-ID publishers (latched) for easy access
+        self.id_pubs = {}  # id -> rospy.Publisher(PointStamped)
+
+        # --- ArUco setup ---
+        dict_id = cv2.aruco.DICT_5X5_100
         try:
-            # New API (OpenCV >= 4.7)
             self.aruco_dict = cv2.aruco.getPredefinedDictionary(dict_id)
             self.aruco_params = cv2.aruco.DetectorParameters()
             self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
             self._use_new_api = True
         except AttributeError:
-            # Old API fallback (OpenCV <= 4.6)
             self.aruco_dict = cv2.aruco.Dictionary_get(dict_id)
             self.aruco_params = cv2.aruco.DetectorParameters_create()
             self._use_new_api = False
 
-        self.aruco_pub = rospy.Publisher('/processed_aruco/image/compressed',
-                                         CompressedImage, queue_size=10)
+        # Publishers
+        self.aruco_pub = rospy.Publisher('/processed_aruco/image/compressed', CompressedImage, queue_size=10)
+        self.marker_pub = rospy.Publisher('/marker_locations', Float32MultiArray, queue_size=10)
+
         self.br = CvBridge()
 
         if not rospy.is_shutdown():
-            self.frame_sub = rospy.Subscriber(self.frame_sub_topic,
-                                              CompressedImage,
-                                              self.img_callback,
+            self.pose_sub  = rospy.Subscriber(self.pose_sub_topic, PoseStamped, self.pose_callback, queue_size=1)
+            self.frame_sub = rospy.Subscriber(self.frame_sub_topic, CompressedImage, self.img_callback,
                                               queue_size=1, buff_size=2**24)
+
+    def pose_callback(self, msg):
+        self.altitude_m = msg.pose.position.z
+
+    def _ensure_intrinsics(self, frame):
+        if self.W is None or self.H is None:
+            self.H, self.W = frame.shape[:2]
+            self.fpx_h = (self.W / 2.0) / np.tan(np.deg2rad(self.hfov_deg / 2.0))
+            self.fpx_v = (self.H / 2.0) / np.tan(np.deg2rad(self.vfov_deg / 2.0))
+            rospy.loginfo(f"[ArucoDetector] Image {self.W}x{self.H}, fpx_h={self.fpx_h:.2f}, fpx_v={self.fpx_v:.2f}")
 
     def img_callback(self, msg_in):
         try:
@@ -42,43 +92,108 @@ class ArucoDetector():
             rospy.logerr(e)
             return
 
-        annotated = self.find_aruco(frame)
-        self.publish_to_ros(annotated)
+        self._ensure_intrinsics(frame)
 
-    def find_aruco(self, frame):
-        # Detect on grayscale for robustness
+        annotated_frame, raw_triples = self.find_aruco_and_project(frame)
+        avg_triples = self.update_and_average(raw_triples)
+
+        self.publish_image(annotated_frame)
+        self.publish_markers(avg_triples)       # aggregate
+        self.publish_per_id(avg_triples)        # per-ID PointStamped (latched)
+
+    def find_aruco_and_project(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         if self._use_new_api:
             corners, ids, _ = self.detector.detectMarkers(gray)
         else:
-            corners, ids, _ = cv2.aruco.detectMarkers(gray, self.aruco_dict,
-                                                      parameters=self.aruco_params)
+            corners, ids, _ = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.aruco_params)
+
+        triples = []  # raw [x,y,id, ...] (meters)
 
         if ids is not None and len(corners) > 0:
             ids = ids.flatten()
-
-            # Quick overlay (also draws IDs if provided)
             cv2.aruco.drawDetectedMarkers(frame, corners, ids)
 
-            # Optional: custom box + ID text (kept close to your original)
-            for (marker_corner, marker_ID) in zip(corners, ids):
-                pts = marker_corner.reshape((4, 2)).astype(int)
-                (tl, tr, br, bl) = [tuple(p) for p in pts]
+            # Height to use
+            if self.use_live_alt and (self.altitude_m is not None) and (self.altitude_m > 0.0):
+                h = float(self.altitude_m)
+            else:
+                h = float(self.fixed_alt_m)
 
-                cv2.line(frame, tl, tr, (0, 255, 0), 2)
-                cv2.line(frame, tr, br, (0, 255, 0), 2)
-                cv2.line(frame, br, bl, (0, 255, 0), 2)
-                cv2.line(frame, bl, tl, (0, 255, 0), 2)
+            cx = self.W / 2.0
+            cy = self.H / 2.0
 
-                rospy.loginfo_throttle(1.0, f"Aruco detected, ID: {marker_ID}")
-                cv2.putText(frame, str(marker_ID),
-                            (tl[0], max(0, tl[1] - 10)),
-                            cv2.FONT_HERSHEY_COMPLEX, 0.6, (0, 255, 0), 2)
+            for (marker_corner, marker_id) in zip(corners, ids):
+                pts = marker_corner.reshape((4, 2)).astype(float)
+                (tl, tr, br, bl) = pts
 
-        return frame
+                u = np.mean([tl[0], tr[0], br[0], bl[0]])  # column
+                v = np.mean([tl[1], tr[1], br[1], bl[1]])  # row
 
-    def publish_to_ros(self, frame):
+                # Convention: top=+x, left=+y (relative to center)
+                x_px = (cy - v)
+                y_px = (cx - u)
+
+                x_m = h * (x_px / self.fpx_v)
+                y_m = h * (y_px / self.fpx_h)
+
+                triples.extend([float(x_m), float(y_m), float(marker_id)])
+
+                # annotate
+                cpt = (int(round(u)), int(round(v)))
+                cv2.circle(frame, cpt, 4, (0, 255, 255), -1)
+                cv2.putText(frame, f"raw({x_m:.2f},{y_m:.2f}) id={int(marker_id)}",
+                            (cpt[0] + 5, cpt[1] - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+
+        return frame, triples
+
+    def update_and_average(self, raw_triples):
+        averaged = []
+        for i in range(0, len(raw_triples), 3):
+            x = raw_triples[i + 0]
+            y = raw_triples[i + 1]
+            mid = int(raw_triples[i + 2])
+
+            self.hist[mid].append((x, y))
+            arr = np.array(self.hist[mid], dtype=float)
+            x_avg, y_avg = arr.mean(axis=0).tolist()
+            averaged.extend([x_avg, y_avg, float(mid)])
+
+        return averaged
+
+    def publish_markers(self, triples):
+        # Aggregate array: [x_avg, y_avg, id, ...]
+        self.marker_pub.publish(Float32MultiArray(data=triples))
+
+    def publish_per_id(self, triples):
+        """
+        For each (x_avg, y_avg, id) in THIS frame, publish a latched PointStamped on:
+          /marker_locations/id/<id>
+        So consumers can just subscribe to the ID they care about.
+        """
+        t = rospy.Time.now()
+        for i in range(0, len(triples), 3):
+            x = float(triples[i + 0])
+            y = float(triples[i + 1])
+            mid = int(triples[i + 2])
+
+            # Build (or reuse) publisher for this ID
+            if mid not in self.id_pubs:
+                topic = f"/marker_locations/id/{mid}"
+                self.id_pubs[mid] = rospy.Publisher(topic, PointStamped, queue_size=1, latch=True)
+                rospy.loginfo(f"[ArucoDetector] Created per-ID topic: {topic}")
+
+            msg = PointStamped()
+            msg.header.stamp = t
+            msg.header.frame_id = "map"  # world-aligned per your convention
+            msg.point.x = x
+            msg.point.y = y
+            msg.point.z = 0.0
+            self.id_pubs[mid].publish(msg)
+
+    def publish_image(self, frame):
         ok, enc = cv2.imencode('.jpg', frame)
         if not ok:
             rospy.logwarn("Failed to encode JPEG")
@@ -86,12 +201,12 @@ class ArucoDetector():
         msg_out = CompressedImage()
         msg_out.header.stamp = rospy.Time.now()
         msg_out.format = "jpeg"
-        msg_out.data = enc.tobytes()   # tostring() is deprecated
+        msg_out.data = enc.tobytes()
         self.aruco_pub.publish(msg_out)
-        
+
 def main():
     rospy.init_node('EGB349_vision', anonymous=True)
-    rospy.loginfo("Processing images...")
+    rospy.loginfo("Publishing averaged marker positions and per-ID topics under /marker_locations/id/<ID> ...")
     _ = ArucoDetector()
     rospy.spin()
 
