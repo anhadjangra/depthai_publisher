@@ -8,7 +8,7 @@
         "NN_family": "YOLO",
         "input_size": "416x416",
         "NN_specific_metadata": {
-            "classes": 3,
+            "classes": 2,
             "coordinates": 4,
             "anchors": [
                 10.0,
@@ -48,14 +48,13 @@
                 ]
             },
             "iou_threshold": 0.5,
-            "confidence_threshold": 0.5
+            "confidence_threshold": 0.8
         }
     },
     "mappings": {
         "labels": [
-            "Backpack",
-            "Hand",
-            "Person"
+            "bag",
+            "person"
         ]
     },
     "version": 1
