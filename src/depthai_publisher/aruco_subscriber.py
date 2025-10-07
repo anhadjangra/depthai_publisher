@@ -18,13 +18,14 @@ class ArucoDetector():
     out_markers_topic          = '/marker_locations'
 
     def __init__(self):
+        self.frame_count = 0
         # ---- Params ----
         self.hfov_deg = float(rospy.get_param('~hfov_deg', 54.0))
         self.vfov_deg = float(rospy.get_param('~vfov_deg', 54.0))
         self.fixed_alt_m = float(rospy.get_param('~fixed_altitude_m', 2.5))
         self.use_live_alt = bool(rospy.get_param('~use_live_altitude', True))
         self.avg_window = int(rospy.get_param('~avg_window', 10))
-        self.publish_first_only = bool(rospy.get_param('~publish_first_only', True))
+        self.publish_first_only = bool(rospy.get_param('~publish_first_only', False))
         self.use_raw_image = bool(rospy.get_param('~use_raw_image', False))
         self.alt_ema_alpha = float(rospy.get_param('~alt_ema_alpha', 0.25))  # altitude smoothing
 
@@ -84,12 +85,16 @@ class ArucoDetector():
         with self._pose_lock:
             self.pos_x = float(msg.pose.position.x)
             self.pos_y = float(msg.pose.position.y)
-            z = float(msg.pose.position.z)
+            z = float(msg.pose.position.z)-0.16
             self._alt_ema = z if self._alt_ema is None else (self.alt_ema_alpha * z + (1 - self.alt_ema_alpha) * self._alt_ema)
             self.altitude_m = self._alt_ema
 
     # -------- Image callback (process every image) --------
     def img_cb(self, img_msg):
+        self.frame_count +=1
+        if self.frame_count %2 != 0:
+            return
+
         # Decode image
         try:
             if isinstance(img_msg, CompressedImage):
@@ -175,7 +180,7 @@ class ArucoDetector():
                 y_cam = h * (y_px / self.fpx_h)
 
                 # Translation-only into local map/ENU (no rotation)
-                x_map = px + x_cam
+                x_map = px + x_cam -0.1
                 y_map = py + y_cam
 
                 # Publish per-ID (latched)
@@ -213,7 +218,6 @@ class ArucoDetector():
         msg.point.y = float(y_map)
         msg.point.z = 0.0
         self.id_pubs[mid].publish(msg)
-
     def publish_image(self, frame):
         ok, enc = cv2.imencode('.jpg', frame)
         if not ok:
